@@ -1,0 +1,974 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+update.py
+Supabase QA-Update mit DeepSeek – interaktiv, farbig, schrittweise pro Frage, mit Dedupe.
+
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
+from difflib import SequenceMatcher
+
+import unicodedata
+
+AUTO_MODE = False
+_NET_NOTICE_SHOWN = False
+
+def _gentle_wait(msg_prefix: str = "Netzwerkproblem erkannt") -> None:
+    global _NET_NOTICE_SHOWN
+    if not _NET_NOTICE_SHOWN:
+        try:
+            print(f"{YELLOW}Hinweis: {msg_prefix}. Warte kurz und versuche erneut.{RESET}")
+        except Exception:
+            pass
+        _NET_NOTICE_SHOWN = True
+
+try:
+    import requests
+except ImportError:
+    print("Fehler: 'requests' fehlt. Installiere mit: pip install requests")
+    sys.exit(1)
+
+# Farben
+try:
+    from colorama import init as colorama_init, Fore, Style
+    colorama_init(autoreset=True)
+    RED = Fore.RED + Style.BRIGHT
+    GREEN = Fore.GREEN + Style.BRIGHT
+    BLUE = Fore.BLUE + Style.BRIGHT
+    CYAN = Fore.CYAN + Style.BRIGHT
+    YELLOW = Fore.YELLOW + Style.BRIGHT
+    RESET = Style.RESET_ALL
+except Exception:
+    RED = GREEN = BLUE = CYAN = YELLOW = RESET = ""
+
+# Defaults (keine Secrets!)
+DEFAULT_TABLE = "deutsch"
+DEEPSEEK_BASE_URL_DEFAULT = "https://api.deepseek.com"
+DEEPSEEK_MODEL_DEFAULT = "deepseek-chat"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SECRETS_PATH = os.path.join(BASE_DIR, "secrets.json")
+SECRETS_EXAMPLE_PATH = os.path.join(BASE_DIR, "secrets.example.json")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+QUESTION_RE = re.compile(r"^Frage(\d+)$")
+ANS_RE = re.compile(r"^Frage(\d+)-Antwort-(\d+)$")
+CORR_RE = re.compile(r"^Frage(\d+)-Antwort-richtig$")
+
+# Utils
+def mask(s: str) -> str:
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return "*" * len(s)
+    return f"{s[:4]}***{s[-4:]}"
+
+def ts() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+def sanitize_json_text(txt: str) -> str:
+    txt = txt.replace("\ufeff", "")
+    return CONTROL_CHAR_PATTERN.sub("", txt)
+
+# Entfernt Sternchen-Markierungen wie *Beispiel* oder **Beispiel** (ohne Multiplikations-Sternchen 2*3 anzutasten)
+ASTERISK_BOLD_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+ASTERISK_ITALIC_RE = re.compile(r"\*([^*\n]+?)\*")
+ASTERISK_STRAY_RE = re.compile(r"(?<!\d)\*(?!\d)")
+
+def strip_asterisk_markup(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    x = str(s)
+    x = ASTERISK_BOLD_RE.sub(r"\1", x)
+    x = ASTERISK_ITALIC_RE.sub(r"\1", x)
+    x = ASTERISK_STRAY_RE.sub("", x)
+    return x
+
+def clean_proposal_text_fields(prop: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(prop, dict):
+        return {}
+    out: Dict[str, Any] = dict(prop)
+    for k in ("q", "a1", "a2", "a3", "a4"):
+        if k in out and out[k] is not None:
+            out[k] = strip_asterisk_markup(out[k])
+    return out
+
+def _is_single_emoji(s: Optional[str]) -> bool:
+    if s is None:
+        return False
+    x = str(s).strip()
+    if not x:
+        return False
+    if any(ch.isspace() for ch in x):
+        return False
+    for ch in x:
+        cat = unicodedata.category(ch)
+        if cat and (cat[0] == "L" or cat[0] == "N"):
+            return False
+    if len(x) > 12:
+        return False
+    return True
+
+def _first_emoji_candidate(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    x = strip_asterisk_markup(str(s)).strip()
+    if not x:
+        return None
+    tok = x.split()[0]
+    tok = tok.strip(" \"'“”„‚’`")
+    if _is_single_emoji(tok):
+        return tok
+    cleaned = "".join(ch for ch in tok if not ch.isalnum())
+    cleaned = cleaned.strip()
+    if _is_single_emoji(cleaned):
+        return cleaned
+    return None
+
+def write_file(path: str, data: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def is_blank(x: Optional[str]) -> bool:
+    return x is None or str(x).strip() == ""
+
+def is_question_truly_empty(q: Dict[str, Any]) -> bool:
+    no_q = is_blank(q.get("q"))
+    a = q.get("a") or [None, None, None, None]
+    all_empty_answers = all(is_blank(ai) for ai in a)
+    return no_q and all_empty_answers
+
+def norm_text(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"\(stand[^)]*\)", "", s)  # entfernt explizit deutsche "Stand(...)"-Zusätze für Dedupe
+    s = re.sub(r"\([^)]*\bversion\b[^)]*\)", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+def sim(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+# Secrets (GitHub-sicher)
+REQUIRED_KEYS = [
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_MODEL",
+    "DEEPSEEK_API_KEY",
+]
+
+DEFAULT_CONFIG = {
+    "SUPABASE_URL": "",                 # z. B. https://xxxx.supabase.co
+    "SUPABASE_KEY": "",                 # nutze bevorzugt einen Server-Key, niemals im Client
+    "DEEPSEEK_BASE_URL": DEEPSEEK_BASE_URL_DEFAULT,
+    "DEEPSEEK_MODEL": DEEPSEEK_MODEL_DEFAULT,
+    "DEEPSEEK_API_KEY": "",             # z. B. sk-...
+}
+
+ENV_KEYS = {
+    "SUPABASE_URL": "SUPABASE_URL",
+    "SUPABASE_KEY": "SUPABASE_KEY",
+    "DEEPSEEK_BASE_URL": "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_MODEL": "DEEPSEEK_MODEL",
+    "DEEPSEEK_API_KEY": "DEEPSEEK_API_KEY",
+}
+
+def write_secrets_example(overwrite: bool = False) -> None:
+    if os.path.exists(SECRETS_EXAMPLE_PATH) and not overwrite:
+        return
+    write_file(SECRETS_EXAMPLE_PATH, DEFAULT_CONFIG.copy())
+
+def load_secrets(reset: bool = False) -> Dict[str, str]:
+    """
+    Reihenfolge:
+    1) Defaults (ohne Secrets)
+    2) Umgebungsvariablen (überschreiben Defaults)
+    3) secrets.json (optional, überschreibt alles)
+
+    Validierung:
+    - SUPABASE_URL, SUPABASE_KEY, DEEPSEEK_API_KEY müssen gesetzt sein.
+    """
+    cfg = DEFAULT_CONFIG.copy()
+
+    # 1) Env
+    for key, env_name in ENV_KEYS.items():
+        val = os.getenv(env_name)
+        if val:
+            cfg[key] = val.strip()
+
+    # 2) secrets.json (optional)
+    if reset:
+        # reset erstellt eine leere secrets.json Vorlage und beendet sich.
+        if not os.path.exists(SECRETS_PATH):
+            write_file(SECRETS_PATH, DEFAULT_CONFIG.copy())
+        write_secrets_example(overwrite=True)
+        print("secrets.json und secrets.example.json wurden (ohne Keys) erstellt/überschrieben.")
+        print("Trage deine Keys lokal in secrets.json ein oder nutze Umgebungsvariablen.")
+        sys.exit(0)
+
+    if os.path.isfile(SECRETS_PATH):
+        try:
+            with open(SECRETS_PATH, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = json.loads(sanitize_json_text(raw))
+                write_file(SECRETS_PATH, data)
+                print("secrets.json repariert.")
+            for k in REQUIRED_KEYS:
+                if k in data and data[k] is not None and str(data[k]).strip() != "":
+                    cfg[k] = str(data[k]).strip()
+        except Exception as e:
+            print(f"Fehler beim Laden von secrets.json: {e}")
+            # cfg bleibt aus Env/Defaults
+
+    # 3) Beispiel-Datei sicherstellen
+    write_secrets_example()
+
+    # 4) Validierung
+    missing = []
+    if not cfg.get("SUPABASE_URL"):
+        missing.append("SUPABASE_URL")
+    if not cfg.get("SUPABASE_KEY"):
+        missing.append("SUPABASE_KEY")
+    if not cfg.get("DEEPSEEK_API_KEY"):
+        missing.append("DEEPSEEK_API_KEY")
+
+    if missing:
+        print(f"{RED}Fehlende Konfiguration: {', '.join(missing)}{RESET}")
+        print("Setze die Werte als Umgebungsvariablen oder in einer lokalen secrets.json.")
+        print("Beispiel (Linux/macOS):")
+        print("  export SUPABASE_URL='https://xxxx.supabase.co'")
+        print("  export SUPABASE_KEY='...'\n  export DEEPSEEK_API_KEY='sk-...'\n")
+        print("Beispiel (Windows PowerShell):")
+        print("  setx SUPABASE_URL \"https://xxxx.supabase.co\"")
+        print("  setx SUPABASE_KEY \"...\"")
+        print("  setx DEEPSEEK_API_KEY \"sk-...\"")
+        sys.exit(2)
+
+    return cfg
+
+# Supabase
+def sb_headers(api_key: str) -> Dict[str, str]:
+    return {
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "return=representation",
+    }
+
+def sb_select(url: str, api_key: str, table: str, params: Dict[str, str]) -> List[Dict[str, Any]]:
+    endpoint = f"{url}/rest/v1/{table}"
+    headers = sb_headers(api_key)
+    params = {"select": "*", **params}
+    last_err = None
+    for k in range(3):
+        try:
+            r = requests.get(endpoint, headers=headers, params=params, timeout=60)
+            if r.status_code != 200:
+                raise RuntimeError(f"Supabase SELECT Fehler {r.status_code}: {r.text}")
+            return r.json()
+        except Exception as e:
+            last_err = e
+            _gentle_wait("Supabase nicht erreichbar")
+            time.sleep(1.2 * (k + 1))
+    raise RuntimeError(f"Supabase SELECT dauerhaft fehlgeschlagen: {last_err}")
+
+def sb_patch(url: str, api_key: str, table: str, row_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    endpoint = f"{url}/rest/v1/{table}"
+    headers = sb_headers(api_key)
+    params = {"id": f"eq.{row_id}"}
+    last_err = None
+    for k in range(3):
+        try:
+            r = requests.patch(endpoint, headers=headers, params=params, data=json.dumps(payload), timeout=60)
+            if r.status_code not in (200, 204):
+                raise RuntimeError(f"Supabase PATCH Fehler {r.status_code}: {r.text}")
+            return r.json()[0] if r.text else {"id": row_id}
+        except Exception as e:
+            last_err = e
+            _gentle_wait("Supabase nicht erreichbar")
+            time.sleep(1.2 * (k + 1))
+    raise RuntimeError(f"Supabase PATCH dauerhaft fehlgeschlagen: {last_err}")
+
+# Fragen I/O
+def extract_questions(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    qmap: Dict[int, Dict[str, Any]] = {}
+    for k, v in row.items():
+        m_q = QUESTION_RE.match(k)
+        m_a = ANS_RE.match(k)
+        m_c = CORR_RE.match(k)
+        if m_q:
+            idx = int(m_q.group(1))
+            qmap.setdefault(idx, {"index": idx, "q": None, "a": [None, None, None, None], "correct": None})
+            qmap[idx]["q"] = v
+        elif m_a:
+            idx = int(m_a.group(1)); ai = int(m_a.group(2))
+            if 1 <= ai <= 4:
+                qmap.setdefault(idx, {"index": idx, "q": None, "a": [None, None, None, None], "correct": None})
+                qmap[idx]["a"][ai - 1] = v
+        elif m_c:
+            idx = int(m_c.group(1))
+            qmap.setdefault(idx, {"index": idx, "q": None, "a": [None, None, None, None], "correct": None})
+            if isinstance(v, (int, float, str)) and str(v).strip().isdigit():
+                qmap[idx]["correct"] = int(str(v).strip())
+            else:
+                qmap[idx]["correct"] = None
+    return [qmap[i] for i in sorted(qmap.keys())]
+
+def build_update_payload_for_one(index: int, prop: Dict[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    if prop.get("q") is not None:
+        payload[f"Frage{index}"] = prop["q"]
+    for i, key in enumerate(["a1", "a2", "a3", "a4"], start=1):
+        if prop.get(key) is not None:
+            payload[f"Frage{index}-Antwort-{i}"] = prop[key]
+    if prop.get("correct") is not None:
+        payload[f"Frage{index}-Antwort-richtig"] = int(prop["correct"])
+    return payload
+
+# DeepSeek Kern
+def balanced_json_extract(s: str) -> Optional[str]:
+    stack = 0
+    end = None
+    for i in range(len(s)-1, -1, -1):
+        ch = s[i]
+        if ch == "}":
+            if stack == 0:
+                end = i + 1
+            stack += 1
+        elif ch == "{":
+            stack -= 1
+            if stack == 0 and end is not None:
+                return s[i:end]
+    return None
+
+def ds_request(base_url: str, api_key: str, model: str, system_msg: str, user_payload: dict, timeout_s: int = 120) -> dict:
+    url = f"{base_url}/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"}
+    }
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout_s)
+    if r.status_code == 401:
+        raise PermissionError(f"401 Authentication Error. Verwendeter Key: {mask(api_key)}")
+    if r.status_code in (429, 500, 502, 503, 504):
+        raise RuntimeError(f"Transienter Fehler {r.status_code}: {r.text}")
+    if r.status_code != 200:
+        raise RuntimeError(f"DeepSeek Fehler {r.status_code}: {r.text}")
+    data = r.json()
+    content = data.get("choices", [{}])[0].get("message", {}).get("content")
+    if not content:
+        raise RuntimeError("Leere Antwort von DeepSeek.")
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        extracted = balanced_json_extract(content or "")
+        if extracted:
+            return json.loads(extracted)
+        raise RuntimeError("DeepSeek-Antwort war kein valides JSON.")
+
+def deepseek_audit_icon(base_url: str, api_key: str, model: str,
+                        topic: str, level: str, language: str,
+                        description: Optional[str],
+                        current_icon: Optional[str]) -> dict:
+    system = (
+        "Du bist ein strenger Fachexperte und UX-Redakteur. "
+        "Prüfe, ob ein Emoji als Icon den Inhalt eines Tests sinnvoll widerspiegelt. "
+        "Gib ausschließlich gültiges JSON aus. Kein Freitext."
+    )
+    user_payload = {
+        "task": "audit_icon",
+        "constraints": {"topic": topic, "level": level, "language": language},
+        "description": description,
+        "current_icon": current_icon,
+        "output_schema": {
+            "keep": "bool",
+            "emoji": "string (ein einzelnes Emoji, kein Text)"
+        },
+        "rules": [
+            "Bewerte, ob 'current_icon' ein passendes Emoji ist, das den Testinhalt widerspiegelt.",
+            "Wenn passend: keep=true und emoji exakt gleich current_icon (getrimmt).",
+            "Wenn nicht passend oder current_icon fehlt/kein Emoji: keep=false und gib ein einzelnes besser passendes Emoji in 'emoji' zurück.",
+            "Gib wirklich nur ein Emoji zurück. Kein Text, keine Doppel-Emoji-Ketten, keine Erklärungen.",
+            "Nur JSON ausgeben."
+        ]
+    }
+    return ds_request(base_url, api_key, model, system, user_payload)
+
+def deepseek_per_question(base_url: str, api_key: str, model: str, topic: str, level: str, language: str, description: Optional[str], q: Dict[str, Any]) -> dict:
+    system = (
+        "Du bist ein strenger Fachexperte für Prüfungsfragen. "
+        "Gib ausschließlich gültiges JSON aus. Kein Freitext."
+    )
+    user_payload = {
+        "task": "audit_one",
+        "constraints": {"topic": topic, "level": level, "language": language},
+        "description": description,
+        "question": {
+            "index": q["index"],
+            "q": q.get("q"),
+            "a1": q["a"][0], "a2": q["a"][1], "a3": q["a"][2], "a4": q["a"][3],
+            "correct": q.get("correct"),
+        },
+        "output_schema": {
+            "index": "int",
+            "status": "ok|revise|fill|drop",
+            "reason": "string",
+            "proposal": {
+                "q": "string|null",
+                "a1": "string|null",
+                "a2": "string|null",
+                "a3": "string|null",
+                "a4": "string|null",
+                "correct": "1|2|3|4|null"
+            }
+        },
+        "rules": [
+            "Nur JSON ausgeben. Keine Erklärungen.",
+            "Sprache muss 'language' entsprechen.",
+            "Bei Lücken 'fill' nutzen und Felder ausfüllen.",
+            "Doppelungen vermeiden. Hier nur diese Frage bewerten.",
+            "Eine richtige Antwort 1..4.",
+            "Aktualisiere veraltete Inhalte strikt auf aktuellen Stand.",
+            "Ergänze Datums- oder Versionsangaben nur dann, wenn die fachliche Korrektheit oder Eindeutigkeit davon abhängt (z. B. Software-Versionen, Gesetze, Preise, Statistiken, Richtlinien oder Funktionen, die sich ändern). Für zeitstabile Grundlagen, Definitionen, Konzepte, Vokabeln und Mathematikgrundlagen keine Datums-/Versionshinweise. Wenn du unsicher bist, lasse den Hinweis weg.",
+            "Wenn du eine Datums-/Versionsangabe ergänzt, füge sie in der Frage in runden Klammern hinzu. Beginne diese Klammer mit dem in 'language' üblichen Terminus für 'as of' (lokalisiert, von dir zu wählen) und niemals mit dem deutschen Wort 'Stand', außer wenn 'language' deutsch ist.",
+            "Entferne Sternchen-Markierungen wie *Beispiel* oder **Beispiel**. Verwende keine Sternchen im Output."
+        ]
+    }
+    return ds_request(base_url, api_key, model, system, user_payload)
+
+def deepseek_replace_duplicate(base_url: str, api_key: str, model: str,
+                               topic: str, level: str, language: str,
+                               description: Optional[str],
+                               kept_question: Dict[str, Any],
+                               duplicate_question: Dict[str, Any]) -> dict:
+    system = (
+        "Du bist ein strenger Fachexperte für Prüfungsfragen. "
+        "Gib ausschließlich gültiges JSON aus. Kein Freitext."
+    )
+    user_payload = {
+        "task": "replace_duplicate",
+        "constraints": {"topic": topic, "level": level, "language": language},
+        "description": description,
+        "kept_question": {
+            "q": kept_question.get("q"),
+            "a1": kept_question["a"][0], "a2": kept_question["a"][1],
+            "a3": kept_question["a"][2], "a4": kept_question["a"][3],
+            "correct": kept_question.get("correct"),
+        },
+        "duplicate_to_replace": {
+            "index": duplicate_question["index"],
+            "q": duplicate_question.get("q"),
+            "a1": duplicate_question["a"][0], "a2": duplicate_question["a"][1],
+            "a3": duplicate_question["a"][2], "a4": duplicate_question["a"][3],
+            "correct": duplicate_question.get("correct"),
+        },
+        "output_schema": {
+            "index": "int",
+            "proposal": {
+                "q": "string",
+                "a1": "string", "a2": "string", "a3": "string", "a4": "string",
+                "correct": "1|2|3|4"
+            },
+            "reason": "string"
+        },
+        "rules": [
+            "Erzeuge eine neue, thematisch passende Frage, die nicht redundant ist zu 'kept_question'.",
+            "Gib ein vollständiges Antwortset mit genau einer richtigen Antwort 1..4.",
+            "Aktualisiere auf aktuellen Wissensstand.",
+            "Ergänze Datums- oder Versionsangaben nur dann, wenn die fachliche Korrektheit oder Eindeutigkeit davon abhängt (z. B. Software-Versionen, Gesetze, Preise, Statistiken, Richtlinien oder Funktionen, die sich ändern). Für zeitstabile Grundlagen, Definitionen, Konzepte, Vokabeln und Mathematikgrundlagen keine Datums-/Versionshinweise. Wenn du unsicher bist, lasse den Hinweis weg.",
+            "Wenn du eine Datums-/Versionsangabe ergänzt, füge sie in der Frage in runden Klammern hinzu. Beginne diese Klammer mit dem in 'language' üblichen Terminus für 'as of' (lokalisiert, von dir zu wählen). Verwende niemals das deutsche Wort 'Stand', außer wenn 'language' deutsch ist.",
+            "Entferne Sternchen-Markierungen wie *Beispiel* oder **Beispiel**. Verwende keine Sternchen im Output.",
+            "Nur JSON ausgeben."
+        ]
+    }
+    return ds_request(base_url, api_key, model, system, user_payload)
+
+# Änderungs-Ermittlung ohne „unverändert“-Zeilen
+def compute_changes(cur: Dict[str, Any], prop: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """
+    Liefert Liste geänderter Felder als (label, alt, neu). Nur wenn wirklich unterschiedlich.
+    """
+    changes: List[Tuple[str, str, str]] = []
+
+    def differ(a: Optional[str], b: Optional[str]) -> bool:
+        return (b is not None) and (str(a or "").strip() != str(b or "").strip())
+
+    if differ(cur.get("q"), prop.get("q")):
+        changes.append(("Frage", str(cur.get("q") or ""), str(prop.get("q") or "")))
+
+    cur_a = cur.get("a") or [None, None, None, None]
+    for i, key in enumerate(["a1", "a2", "a3", "a4"], start=1):
+        if differ(cur_a[i-1], prop.get(key)):
+            changes.append((f"A{i}", str(cur_a[i-1] or ""), str(prop.get(key) or "")))
+
+    if prop.get("correct") is not None and cur.get("correct") != prop.get("correct"):
+        changes.append(("Richtig", str(cur.get("correct")), str(prop.get("correct"))))
+
+    return changes
+
+def _has_answer_changes(cur: Dict[str, Any], prop: Dict[str, Any]) -> bool:
+    cur_a = cur.get("a") or [None, None, None, None]
+    for i, key in enumerate(["a1", "a2", "a3", "a4"], start=1):
+        if prop.get(key) is not None and (str(cur_a[i-1] or "").strip() != str(prop.get(key) or "").strip()):
+            return True
+    return prop.get("correct") is not None and cur.get("correct") != prop.get("correct")
+
+def _is_question_change_only(cur: Dict[str, Any], prop: Dict[str, Any], status: str) -> bool:
+    if (status or "").lower() == "drop":
+        return False
+    if prop.get("q") is None:
+        return False
+    if _has_answer_changes(cur, prop):
+        return False
+    return str(cur.get("q") or "").strip() != str(prop.get("q") or "").strip()
+
+def _is_improvement(entry: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    status = (entry.get("status") or "").lower()
+    prop = entry.get("proposal") or {}
+    if status not in ("", "ok"):
+        return True
+    changes = compute_changes(current, prop)
+    return len(changes) > 0
+
+# Anzeige
+def print_one_question_step(row: Dict[str, Any], entry: Dict[str, Any], is_duplicate_replacement: bool = False) -> None:
+    q_current_map = {q["index"]: q for q in extract_questions(row)}
+    idx = entry.get("index")
+    cur = q_current_map.get(idx, None)
+    pb = entry.get("proposal") or {}
+
+    print("\n" + "=" * 80)
+    prefix = "🔁 Duplikat-Ersatz" if is_duplicate_replacement else "🧩 Datensatz"
+    header = f"{CYAN}{prefix} · ID {row.get('id')} · Frage {idx}{RESET}"
+    print(header)
+    print(f"{YELLOW}🏷️ Titel:{RESET} {row.get('Titel')}")
+    print(f"{YELLOW}🗣️ Sprache:{RESET} {row.get('Sprache')}   {YELLOW}🎯 Level:{RESET} {row.get('level')}")
+    if row.get("Beschreibung"):
+        print(f"{YELLOW}📝 Beschreibung:{RESET} {row.get('Beschreibung')}")
+    print("-" * 80)
+    if cur:
+        print(f"{BLUE}🔎 Aktuell:{RESET}")
+        print(f"   Frage: {cur.get('q')}")
+        print(f"   A1: {cur['a'][0]}")
+        print(f"   A2: {cur['a'][1]}")
+        print(f"   A3: {cur['a'][2]}")
+        print(f"   A4: {cur['a'][3]}")
+        print(f"   Richtig: {cur.get('correct')}")
+    print("-" * 80)
+    print(f"{BLUE}🛠️ Vorschlag:{RESET}")
+    if entry.get("status"):
+        print(f"   Status: {entry.get('status')}")
+    if entry.get("reason"):
+        print(f"   Grund: {entry.get('reason')}")
+
+    changes = compute_changes(cur or {"a": [None, None, None, None]}, pb)
+    if changes:
+        for label, old, new in changes:
+            if label == "Richtig":
+                if old not in ("", "None"):
+                    print(f"   {RED}❌ {label} (alt): {old}{RESET}")
+                print(f"   {GREEN}✅ {label} (neu): {new}{RESET}")
+            else:
+                if str(old).strip():
+                    print(f"   {RED}❌ {label} (alt): {old}{RESET}")
+                print(f"   {GREEN}✅ {label} (neu): {new}{RESET}")
+    else:
+        print("   Keine konkreten Änderungen erkannt.")
+
+    print("=" * 80)
+
+def log_proposal_step(row_id: int, entry: Dict[str, Any], row: Dict[str, Any]) -> str:
+    path = os.path.join(LOG_DIR, f"{row_id}-q{entry.get('index')}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# Änderungsprotokoll ID {row_id} · Frage {entry.get('index')}\n\n")
+        f.write("## Vorschlag (JSON)\n\n```json\n")
+        f.write(json.dumps(entry, ensure_ascii=False, indent=2))
+        f.write("\n```\n\n## Original (gekürzt)\n\n```json\n")
+        qmap = {q["index"]: q for q in extract_questions(row)}
+        cur = qmap.get(entry.get("index"))
+        f.write(json.dumps(cur, ensure_ascii=False, indent=2))
+        f.write("\n```\n")
+    return path
+
+def prompt_yes_no_quit(msg: str) -> str:
+    if AUTO_MODE:
+        return "j"
+    while True:
+        ans = input(f"{msg} [j/n/q] ").strip().lower()
+        if ans == "":
+            return "j"
+        if ans in ("j", "n", "q"):
+            return ans
+
+# Dedupe
+def find_duplicate_groups(questions: List[Dict[str, Any]], threshold: float) -> List[List[int]]:
+    items = [(q["index"], norm_text(q.get("q"))) for q in questions if not is_blank(q.get("q"))]
+    groups: List[List[int]] = []
+    used: set = set()
+    for i in range(len(items)):
+        idx_i, ti = items[i]
+        if idx_i in used:
+            continue
+        group = [idx_i]
+        for j in range(i + 1, len(items)):
+            idx_j, tj = items[j]
+            if idx_j in used:
+                continue
+            if ti and tj and sim(ti, tj) >= threshold:
+                group.append(idx_j)
+        if len(group) > 1:
+            for gidx in group:
+                used.add(gidx)
+            groups.append(group)
+    return groups
+
+# Main
+def main():
+    parser = argparse.ArgumentParser(description="QA-Update Supabase mit DeepSeek")
+    parser.add_argument("--table", default=DEFAULT_TABLE)
+    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--filter", default=None, help="Feld=Wert")
+    parser.add_argument("--only-id", type=int, default=None)
+    parser.add_argument("--reset-secrets", action="store_true", help="Erstellt leere secrets.json + secrets.example.json und beendet.")
+    parser.add_argument("--deepseek-key", default=None, help="Optional: DEEPSEEK_API_KEY setzen und in secrets.json speichern (lokal).")
+    parser.add_argument("--max-questions", type=int, default=40)
+    parser.add_argument("--dedupe", action="store_true", default=True)
+    parser.add_argument("--dedupe-threshold", type=float, default=0.9)
+    parser.add_argument("--auto", action="store_true", help="Automatischer Durchlauf ohne Bestätigungen")
+    args = parser.parse_args()
+
+    secrets = load_secrets(reset=args.reset_secrets)
+
+    global AUTO_MODE
+    AUTO_MODE = bool(args.auto)
+    if not AUTO_MODE:
+        try:
+            sel = input("Automatisch durchlaufen ohne Einzelfragen? [j/N] ").strip().lower()
+            AUTO_MODE = (sel == "j")
+        except Exception:
+            AUTO_MODE = False
+
+    if args.deepseek_key:
+        # Key bewusst nur lokal speichern, niemals committen (.gitignore).
+        secrets["DEEPSEEK_API_KEY"] = args.deepseek_key.strip()
+        try:
+            write_file(SECRETS_PATH, secrets)
+            print(f"DeepSeek-Key lokal gespeichert: {mask(secrets['DEEPSEEK_API_KEY'])}")
+        except Exception as e:
+            print(f"{RED}Konnte secrets.json nicht schreiben: {e}{RESET}")
+
+    table = args.table
+    sb_url = secrets["SUPABASE_URL"]
+    sb_key = secrets["SUPABASE_KEY"]
+    ds_base = secrets["DEEPSEEK_BASE_URL"]
+    ds_key = secrets["DEEPSEEK_API_KEY"]
+    ds_model = secrets["DEEPSEEK_MODEL"]
+
+    # Interaktive Auswahl: Anzahl oder alle
+    try:
+        sel_count = input("Wie viele Datensätze verarbeiten? Zahl eingeben oder 'a' für alle: ").strip().lower()
+    except Exception:
+        sel_count = ""
+
+    process_all = (sel_count == "a")
+    try:
+        requested_count = int(sel_count) if sel_count and not process_all else None
+    except ValueError:
+        requested_count = None
+
+    params: Dict[str, str] = {}
+    rows: List[Dict[str, Any]] = []
+    row_iter = None
+
+    # Optionaler Filter
+    filter_field = None
+    filter_value = None
+    if args.filter and "=" in args.filter:
+        filter_field, filter_value = args.filter.split("=", 1)
+        filter_field = filter_field.strip()
+        filter_value = filter_value.strip()
+
+    if args.only_id is not None:
+        params["id"] = f"eq.{args.only_id}"
+        try:
+            rows = sb_select(sb_url, sb_key, table, params)
+        except Exception as e:
+            print(f"Abbruch: {e}")
+            sys.exit(1)
+        row_iter = rows
+    else:
+        if process_all:
+            # Paginierter Abruf und sofortige Verarbeitung (kein Vorab-Laden aller Datensätze)
+            def _row_generator():
+                batch = max(1, min(args.limit, 1000))
+                offset = 0
+                total = 0
+                while True:
+                    params.clear()
+                    params["limit"] = str(batch)
+                    params["offset"] = str(offset)
+                    if filter_field and filter_value:
+                        params[filter_field] = f"eq.{filter_value}"
+                    try:
+                        page = sb_select(sb_url, sb_key, table, params) or []
+                    except Exception:
+                        _gentle_wait("Netzwerkproblem beim Seitenabruf")
+                        try:
+                            page = sb_select(sb_url, sb_key, table, params) or []
+                        except Exception as ee:
+                            print(f"Abbruch: {ee}")
+                            sys.exit(1)
+                    got = len(page)
+                    total += got
+                    print(f"Geladen: +{got} (gesamt {total}), offset={offset}")
+                    for _r in page:
+                        yield _r
+                    if got < batch:
+                        break
+                    offset += batch
+            row_iter = _row_generator()
+        else:
+            # Begrenzter Abruf anhand gewünschter Anzahl oder --limit
+            limit_val = requested_count if requested_count is not None else args.limit
+            offset_val = args.offset
+            params["limit"] = str(limit_val)
+            params["offset"] = str(offset_val)
+            if filter_field and filter_value:
+                params[filter_field] = f"eq.{filter_value}"
+            try:
+                rows = sb_select(sb_url, sb_key, table, params)
+            except Exception as e:
+                print(f"Abbruch: {e}")
+                sys.exit(1)
+            row_iter = rows
+
+    processed_any = False
+
+    for row in row_iter:
+        processed_any = True
+        row_id = row.get("id")
+        questions_all = extract_questions(row)
+        questions = [q for q in questions_all if not is_question_truly_empty(q)]
+        if not questions:
+            print(f"ID {row_id}: Nur vollständig leere Fragen vorhanden. Übersprungen.")
+            continue
+        if args.max_questions and len(questions) > args.max_questions:
+            questions = questions[:args.max_questions]
+
+        topic = " • ".join([str(row.get(x)) for x in ["Category", "Subcategory", "Titel"] if row.get(x)]) or "Allgemein"
+        level = row.get("level") or ""
+        language = row.get("Sprache") or ""
+        description = row.get("Beschreibung") or ""
+
+        # Icon prüfen und ggf. aktualisieren (Emoji, kein Text)
+        try:
+            current_icon_raw = row.get("Icon")
+            current_icon = strip_asterisk_markup(current_icon_raw) if current_icon_raw is not None else None
+            resp_icon = None
+            last_icon_err = None
+            for kk in range(3):
+                try:
+                    resp_icon = deepseek_audit_icon(
+                        ds_base, ds_key, ds_model,
+                        topic=topic, level=level, language=language,
+                        description=description,
+                        current_icon=(str(current_icon).strip() if current_icon is not None else None)
+                    )
+                    break
+                except Exception as e:
+                    last_icon_err = e
+                    _gentle_wait("DeepSeek nicht erreichbar (Icon)")
+                    time.sleep(1.0 * (kk + 1))
+            if resp_icon and not last_icon_err:
+                keep_flag = resp_icon.get("keep")
+                if keep_flag is None:
+                    keep_flag = resp_icon.get("ok")
+                new_emoji = _first_emoji_candidate(resp_icon.get("emoji") or resp_icon.get("icon"))
+                cur_ok = _is_single_emoji(current_icon) if current_icon is not None else False
+                cur_trim = str(current_icon).strip() if current_icon is not None else ""
+                if (keep_flag is True and cur_ok):
+                    pass
+                else:
+                    if new_emoji and (not cur_ok or new_emoji != cur_trim):
+                        try:
+                            _ = sb_patch(sb_url, sb_key, table, row_id, {"Icon": new_emoji})
+                            print(f"{GREEN}✔ Icon aktualisiert · ID {row_id}: {cur_trim or '∅'} -> {new_emoji}{RESET}")
+                            row["Icon"] = new_emoji
+                        except Exception as e:
+                            print(f"{RED}✖ Icon-Update fehlgeschlagen (ID {row_id}): {e}{RESET}")
+        except Exception:
+            pass
+
+        # Dedupe
+        if args.dedupe:
+            groups = find_duplicate_groups(questions, args.dedupe_threshold)
+            qmap = {q["index"]: q for q in questions}
+            for grp in groups:
+                keeper_idx = grp[0]
+                for dup_idx in grp[1:]:
+                    kept_q = qmap[keeper_idx]
+                    dup_q = qmap[dup_idx]
+                    resp = None
+                    last_err = None
+                    for k in range(3):
+                        try:
+                            resp = deepseek_replace_duplicate(
+                                ds_base, ds_key, ds_model,
+                                topic, level, language,
+                                description, kept_q, dup_q
+                            )
+                            break
+                        except Exception as e:
+                            last_err = e
+                            _gentle_wait("DeepSeek nicht erreichbar")
+                            time.sleep(1.2 * (k + 1))
+                    if last_err:
+                        print(f"{RED}ID {row_id}: Duplikat-Ersatz für Frage {dup_idx} fehlgeschlagen: {last_err}{RESET}")
+                        continue
+
+                    proposal = clean_proposal_text_fields(resp.get("proposal") or {})
+                    entry = {
+                        "index": resp.get("index", dup_idx),
+                        "status": "revise",
+                        "reason": resp.get("reason") or "Duplikat ersetzt",
+                        "proposal": {
+                            "q": proposal.get("q"),
+                            "a1": proposal.get("a1"),
+                            "a2": proposal.get("a2"),
+                            "a3": proposal.get("a3"),
+                            "a4": proposal.get("a4"),
+                            "correct": proposal.get("correct"),
+                        }
+                    }
+
+                    print_one_question_step(row, entry, is_duplicate_replacement=True)
+                    log_path = log_proposal_step(row_id, entry, row)
+                    print(f"{BLUE}🔷 Protokoll: {log_path}{RESET}")
+
+                    ans = prompt_yes_no_quit("Duplikat ersetzen und Änderung übernehmen?")
+                    if ans == "q":
+                        print("Beendet.")
+                        sys.exit(0)
+                    if ans == "j":
+                        payload = build_update_payload_for_one(entry["index"], entry["proposal"])
+                        if payload:
+                            try:
+                                _ = sb_patch(sb_url, sb_key, table, row_id, payload)
+                                print(f"{GREEN}✔ Duplikat ersetzt (ID {row_id}, Frage {entry['index']}){RESET}")
+                                qmap[dup_idx]["q"] = entry["proposal"]["q"]
+                                qmap[dup_idx]["a"] = [
+                                    entry["proposal"]["a1"],
+                                    entry["proposal"]["a2"],
+                                    entry["proposal"]["a3"],
+                                    entry["proposal"]["a4"],
+                                ]
+                                qmap[dup_idx]["correct"] = int(entry["proposal"]["correct"])
+                            except Exception as e:
+                                print(f"{RED}✖ Update fehlgeschlagen (ID {row_id}, Frage {entry['index']}): {e}{RESET}")
+                        else:
+                            print(f"{BLUE}Keine änderbaren Felder im Vorschlag.{RESET}")
+                    else:
+                        print(f"{YELLOW}↷ Duplikat-Ersatz verworfen (ID {row_id}, Frage {entry['index']}).{RESET}")
+
+        # Normale Prüfung pro Frage
+        for q in questions:
+            resp = None
+            last_err = None
+            for k in range(3):
+                try:
+                    resp = deepseek_per_question(
+                        ds_base, ds_key, ds_model,
+                        topic=topic, level=level, language=language, description=description, q=q
+                    )
+                    break
+                except Exception as e:
+                    last_err = e
+                    _gentle_wait("DeepSeek nicht erreichbar")
+                    time.sleep(1.2 * (k + 1))
+            if last_err:
+                print(f"ID {row_id}: Frage {q['index']} DeepSeek-Fehler: {last_err}")
+                continue
+
+            entry = {
+                "index": resp.get("index", q["index"]),
+                "status": resp.get("status") or "",
+                "reason": resp.get("reason"),
+                "proposal": clean_proposal_text_fields(resp.get("proposal") or {})
+            }
+
+            if not _is_improvement(entry, q):
+                continue
+
+            status = entry["status"]
+            prop = entry["proposal"]
+
+            # Nur Fragetext geändert -> automatisch
+            if _is_question_change_only(q, prop, status):
+                payload = build_update_payload_for_one(entry["index"], {"q": prop.get("q")})
+                try:
+                    _ = sb_patch(sb_url, sb_key, table, row_id, payload)
+                    print(f"{GREEN}✔ Automatisch aktualisiert (nur Frage) · ID {row_id}, Frage {entry['index']}{RESET}")
+                except Exception as e:
+                    print(f"{RED}✖ Auto-Update fehlgeschlagen (ID {row_id}, Frage {entry['index']}): {e}{RESET}")
+                print_one_question_step(row, entry)
+                log_path = log_proposal_step(row_id, entry, row)
+                print(f"{BLUE}🔷 Protokoll: {log_path}{RESET}")
+                time.sleep(0.2)
+                continue
+
+            # Antworten betroffen oder drop -> bestätigen
+            print_one_question_step(row, entry)
+            log_path = log_proposal_step(row_id, entry, row)
+            print(f"{BLUE}🔷 Protokoll: {log_path}{RESET}")
+
+            ans = prompt_yes_no_quit("Antworten/Struktur ändern. Änderungen übernehmen?")
+            if ans == "q":
+                print("Beendet.")
+                sys.exit(0)
+            if ans == "j":
+                payload = build_update_payload_for_one(entry["index"], prop)
+                if payload:
+                    try:
+                        _ = sb_patch(sb_url, sb_key, table, row_id, payload)
+                        print(f"{GREEN}✔ Aktualisiert (ID {row_id}, Frage {entry['index']}): {list(payload.keys())}{RESET}")
+                    except Exception as e:
+                        print(f"{RED}✖ Update fehlgeschlagen (ID {row_id}, Frage {entry['index']}): {e}{RESET}")
+                else:
+                    print(f"{BLUE}Keine änderbaren Felder im Vorschlag.{RESET}")
+            else:
+                print(f"{YELLOW}↷ Übersprungen (ID {row_id}, Frage {entry['index']}).{RESET}")
+
+            time.sleep(0.3)
+
+    if not processed_any:
+        print("Keine Datensätze gefunden.")
+        sys.exit(0)
+
+    print("Fertig.")
+
+if __name__ == "__main__":
+    main()
